@@ -16,11 +16,11 @@ sudo chmod +x /usr/local/bin/update-github-hosts
 ```
 sudo update-github-hosts
 ```
-#定时更新（推荐）
+# 定时更新（推荐）
 ```bash
 sudo crontab -e
 ```
-添加以下行（每周日凌晨 3 点自动更新）：
+# 添加以下行（每周日凌晨 3 点自动更新）：
 ```
 0 3 * * 0 /usr/local/bin/update-github-hosts
 ```
