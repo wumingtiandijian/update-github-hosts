@@ -1,6 +1,3 @@
-# update-github-hosts
-自动更新 GitHub520 hosts，带网络测试和回滚机制（广泛兼容版 v6.20）
-
 # GitHub520 Hosts Updater v6.20
 
 自动更新 GitHub520 hosts，带网络测试和回滚机制，广泛兼容主流 Linux 发行版。
@@ -19,7 +16,7 @@ sudo chmod +x /usr/local/bin/update-github-hosts
 ```
 sudo update-github-hosts
 ```
-定时更新（推荐）
+#定时更新（推荐）
 ```bash
 sudo crontab -e
 ```
