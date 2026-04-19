@@ -7,10 +7,8 @@
 
 ## 快速使用
 
-```bash
 # 下载脚本
-```
-```
+```bash
 sudo curl -fsSL https://raw.githubusercontent.com/wumingtiandijian/update-github-hosts/main/update-github-hosts -o /usr/local/bin/update-github-hosts
 ```
 # 赋予执行权限
