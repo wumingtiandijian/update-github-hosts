@@ -25,6 +25,7 @@ sudo crontab -e
 0 3 * * 0 /usr/local/bin/update-github-hosts
 ```
 特性
+
 ✅ 原子更新，写入失败自动回滚
 
 ✅ 网络实测，无效 IP 立即回滚
