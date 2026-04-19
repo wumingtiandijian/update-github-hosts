@@ -1,0 +1,309 @@
+#!/bin/bash
+# 功能：自动更新 GitHub520 hosts，带网络测试和回滚机制（广泛兼容版 v6.20）
+# 用法：需要 root 权限运行，建议通过 cron 每周执行一次
+# 适用：Linux Mint / Ubuntu / Debian / CentOS 6/7+ / RHEL
+# 更新记录：
+#   v1.0 - 基础功能：直接下载并追加
+#   v2.0 - 加入备份与简单替换
+#   v3.0 - 增加回滚和重试
+#   v4.0 - 网络测试升级为 HTTP 状态码
+#   v5.0 - 精确验证与锁机制
+#   v6.0 - 兼容性与原子性优化
+#   v6.1 - 修复 CentOS 6 curl --resolve 问题，加固 rollback
+#   v6.2 - 增加多源备选下载列表，提升下载可靠性
+#   v6.3 - 增强 sed 块删除的安全性，优化 curl 特性检测（兼容 BusyBox）
+#   v6.4 - 微调：xargs 增加 -r 避免空列表报错；降级测试日志增加提示信息
+#   v6.5 - 强化标记清理（暴力删除残留）；优化 curl --resolve 检测逻辑；回滚后清空备份变量
+#   v6.6 - 恢复标记完整性检查，优先范围删除保留用户内容，孤行时降级为暴力清理
+#   v6.7 - 修复两处边界问题：空 hosts 文件不再绕过验证；curl 移除 -f 以正确记录 HTTP 状态码
+#   v6.8 - 增加多测试域名容错（github.com / raw.githubusercontent.com）；glob 表达式加引号防空格
+#   v6.9 - 优化下载失败日志：HTTP 000 明确提示“无法连接或超时”
+#   v6.10 - curl --resolve 检测增加 --noproxy '*'，避免代理干扰误判
+#   v6.11 - 回退 --noproxy 以兼容 CentOS 6；显式设置 PATH 避免 cron 环境缺失
+#   v6.12 - 修复：curl 下载失败时因 set -e 意外退出的严重问题（命令替换追加 || echo "000"）
+#   v6.13 - 加固：mktemp 失败时提前报错；修复 set -e 下 ls 管道可能意外退出的隐患
+#   v6.14 - 修复：mv 覆盖后强制设置 /etc/hosts 权限为 644，避免非 root 进程无法读取
+#   v6.15 - 优化：增加下载超时控制；原子权限预置；预创建日志目录
+#   v6.16 - 修复：curl 检测重定向顺序；支持 IPv6 地址测试；增强 hosts 解析健壮性；显式处理 cp 失败
+#   v6.17 - 优化：IPv6 方括号判断更鲁棒；网络测试强制指定地址族（-4/-6）
+#   v6.18 - 优化：去除下载内容中的 CRLF 换行符，保持 hosts 文件纯 Unix 格式
+#   v6.19 - 修复：curl_supports_resolve 重定向顺序错误导致检测失效；增强 get_ip_from_hosts 匹配别名；预创建锁文件目录
+#   v6.20 - 优化：get_ip_from_hosts 排除注释行；锁目录创建失败时显式报错
+
+set -euo pipefail
+
+# === 显式设置 PATH，防止 cron 环境下命令找不到 ===
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# === 检查 root 权限 ===
+if [ "$EUID" -ne 0 ]; then
+    echo "请使用 root 权限执行（例如 sudo $0）"
+    exit 1
+fi
+
+# === 检查依赖命令 ===
+for cmd in curl sed tee grep awk flock; do
+    if ! command -v $cmd &>/dev/null; then
+        echo "错误：$cmd 未安装，请先安装。"
+        exit 1
+    fi
+done
+
+# === 文件锁（v6.20 显式处理目录创建失败） ===
+LOCK_FILE="/var/lock/update_github_hosts.lock"
+if ! mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null; then
+    echo "错误：无法创建锁文件目录 $(dirname "$LOCK_FILE")" >&2
+    exit 1
+fi
+exec 200>"$LOCK_FILE"
+if ! flock -n 200; then
+    echo "另一个脚本实例正在运行，退出。"
+    exit 1
+fi
+
+# === 定义变量 ===
+LOG_FILE="/var/log/update_github_hosts.log"
+
+# v6.15 优化：确保日志目录存在
+mkdir -p "$(dirname "$LOG_FILE")" || { echo "无法创建日志目录"; exit 1; }
+
+# v6.13 加固：检查 mktemp 是否成功
+TEMP_FILE=$(mktemp) || { log "错误：无法创建临时文件"; exit 1; }
+HOSTS_TMP=$(mktemp) || { log "错误：无法创建临时文件"; rm -f "$TEMP_FILE"; exit 1; }
+
+BACKUP_PREFIX="/etc/hosts.bak."
+BACKUP_FILE=""
+MAX_BACKUPS=5
+MAX_RETRIES=3
+
+TEST_DOMAINS=("github.com" "raw.githubusercontent.com")
+
+START_TAG="#--- GitHub520 Hosts Start ---"
+END_TAG="#--- GitHub520 Hosts End ---"
+
+# === 备选下载源列表（按优先级排序）===
+DOWNLOAD_URLS=(
+    "https://raw.hellogithub.com/hosts"
+    "https://cdn.jsdelivr.net/gh/521xueweihan/GitHub520@main/hosts"
+    "https://gh-proxy.com/https://raw.githubusercontent.com/521xueweihan/GitHub520/main/hosts"
+    "https://raw.githubusercontent.com/521xueweihan/GitHub520/main/hosts"
+    "https://gitee.com/klmahuaw/GitHub520/raw/main/hosts"
+)
+
+# 清理临时文件（锁文件不删除）
+trap 'rm -f "$TEMP_FILE" "$HOSTS_TMP"' EXIT
+
+# === 日志函数 ===
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
+# === 从 hosts 中精确提取域名的 IP（v6.20 排除注释行） ===
+get_ip_from_hosts() {
+    local domain="$1"
+    awk -v d="$domain" '/^[^#]/ {for(i=2;i<=NF;i++) if($i==d) {print $1; exit}}' /etc/hosts
+}
+
+# === 检测 curl 是否支持 --resolve 参数（v6.19 修复重定向顺序） ===
+curl_supports_resolve() {
+    local err_output
+    err_output=$(curl -s --resolve "localhost:80:127.0.0.1" "http://localhost" --head --max-time 1 2>&1 >/dev/null)
+    if echo "$err_output" | grep -qiE "unrecognized|unknown.*resolve|invalid option"; then
+        return 1
+    fi
+    return 0
+}
+
+# === 网络测试：验证新 hosts 是否生效（多域名容错，兼容旧版 curl，v6.17 优化 IPv6 处理） ===
+network_ok() {
+    local domain
+    local expected_ip
+    local tested=0
+
+    for domain in "${TEST_DOMAINS[@]}"; do
+        expected_ip=$(get_ip_from_hosts "$domain")
+        if [ -z "$expected_ip" ]; then
+            log "警告：新 hosts 中未找到 $domain 的 IP 记录，跳过此域名。"
+            continue
+        fi
+        tested=1
+
+        if curl_supports_resolve; then
+            # v6.17 优化：更鲁棒的方括号添加逻辑（覆盖纯 IPv6 和 IPv4-mapped 地址）
+            local resolve_ip="$expected_ip"
+            if [[ "$expected_ip" == *:* && "$expected_ip" != \[* ]]; then
+                resolve_ip="[${expected_ip}]"
+            fi
+
+            # v6.17 优化：强制指定地址族，确保测试使用与目标 IP 一致的协议栈
+            local curl_af=""
+            if [[ "$expected_ip" == *:* ]]; then
+                curl_af="-6"
+            else
+                curl_af="-4"
+            fi
+
+            log "使用 --resolve 精确测试 $domain 的 IP ${resolve_ip} (地址族: ${curl_af#-})"
+            if curl -s $curl_af --resolve "${domain}:443:${resolve_ip}" "https://${domain}" --head --max-time 10 --connect-timeout 5 >/dev/null; then
+                log "测试通过：$domain (HTTPS)"
+                return 0
+            fi
+            if curl -s $curl_af --resolve "${domain}:80:${resolve_ip}" "http://${domain}" --head --max-time 10 --connect-timeout 5 >/dev/null; then
+                log "测试通过：$domain (HTTP)"
+                return 0
+            fi
+            log "警告：通过新 hosts IP ${expected_ip} 访问 $domain 失败。"
+        else
+            log "注意：当前 curl 版本过旧（不支持 --resolve），降级为普通连通性测试（$domain）。"
+            if curl -s --head --max-time 10 --connect-timeout 5 "https://${domain}" >/dev/null; then
+                log "降级测试通过：$domain (HTTPS)（注意：本次未强制验证新 IP）"
+                return 0
+            fi
+            if curl -s --head --max-time 10 --connect-timeout 5 "http://${domain}" >/dev/null; then
+                log "降级测试通过：$domain (HTTP)（注意：本次未强制验证新 IP）"
+                return 0
+            fi
+            log "警告：降级测试 $domain 失败。"
+        fi
+    done
+
+    if [ $tested -eq 0 ]; then
+        log "错误：新 hosts 中未找到任何测试域名的 IP 记录，视为无效更新。"
+    else
+        log "错误：所有测试域名均无法通过新 hosts 访问。"
+    fi
+    return 1
+}
+
+# === 刷新 DNS 缓存（兼容 systemd / sysvinit / nscd） ===
+flush_dns_cache() {
+    if command -v systemctl >/dev/null && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        systemctl restart systemd-resolved && log "已刷新 systemd-resolved 缓存"
+        return
+    fi
+    if command -v systemctl >/dev/null && systemctl is-active --quiet dnsmasq 2>/dev/null; then
+        systemctl restart dnsmasq && log "已刷新 dnsmasq 缓存（systemd）"
+        return
+    fi
+    if [ -f /etc/init.d/dnsmasq ] && /etc/init.d/dnsmasq status >/dev/null 2>&1; then
+        /etc/init.d/dnsmasq restart && log "已刷新 dnsmasq 缓存（sysvinit）"
+        return
+    fi
+    if command -v nscd >/dev/null; then
+        nscd -i hosts 2>/dev/null && log "已刷新 nscd hosts 缓存"
+        return
+    fi
+    log "未检测到已知 DNS 缓存服务，跳过刷新"
+}
+
+# === 回滚到上一个备份（原子替换，v6.16 显式处理 cp 失败） ===
+rollback() {
+    local latest_backup
+    # v6.13 加固：确保管道失败时不会因 set -e 退出
+    latest_backup=$(ls -1t "${BACKUP_PREFIX}"* 2>/dev/null | head -n1 || true)
+    if [ -n "$latest_backup" ]; then
+        if ! cp "$latest_backup" "$HOSTS_TMP"; then
+            log "严重错误：复制备份文件 $latest_backup 失败"
+            return 1
+        fi
+        chmod 644 "$HOSTS_TMP"
+        mv "$HOSTS_TMP" /etc/hosts
+        log "已回滚到备份文件：$latest_backup"
+        if [ -n "$1" ] && [ -f "$1" ]; then
+            rm -f "$1"
+            log "已删除本次产生的无效备份：$1"
+        fi
+        flush_dns_cache
+    else
+        log "错误：没有可用的备份文件，无法回滚！"
+        return 1
+    fi
+}
+
+# === 清理旧备份 ===
+clean_old_backups() {
+    local backups
+    # v6.13 加固：确保管道失败时不会因 set -e 退出
+    backups=$(ls -1t "${BACKUP_PREFIX}"* 2>/dev/null | tail -n +$((MAX_BACKUPS+1)) || true)
+    if [ -n "$backups" ]; then
+        echo "$backups" | xargs -r rm -f
+        log "已清理旧备份文件"
+    fi
+}
+
+# === 主流程 ===
+log "========== 开始更新 GitHub hosts =========="
+log "系统信息：$(uname -a)"
+log "Bash 版本：$BASH_VERSION"
+log "curl 版本：$(curl --version | head -n1)"
+
+BACKUP_FILE="${BACKUP_PREFIX}$(date +%Y%m%d%H%M%S).$$"
+cp /etc/hosts "$BACKUP_FILE"
+log "已备份当前 hosts 到 $BACKUP_FILE"
+
+for attempt in $(seq 1 $MAX_RETRIES); do
+    log "第 $attempt 轮尝试，共 ${MAX_RETRIES} 轮，每轮将依次尝试 ${#DOWNLOAD_URLS[@]} 个下载源..."
+    download_success=0
+
+    for url in "${DOWNLOAD_URLS[@]}"; do
+        log "尝试从 $url 下载..."
+        # v6.15 增加超时控制，防止 curl 无限阻塞
+        HTTP_CODE=$(curl -sSL --connect-timeout 10 --max-time 30 -w '%{http_code}' "$url" -o "$TEMP_FILE" 2>/dev/null || echo "000")
+        if [ "$HTTP_CODE" = "200" ] && [ -s "$TEMP_FILE" ]; then
+            log "下载成功：$url"
+            download_success=1
+            break
+        else
+            if [ "$HTTP_CODE" = "000" ]; then
+                log "下载失败：$url (无法连接或超时)"
+            else
+                log "下载失败：$url (HTTP $HTTP_CODE)"
+            fi
+        fi
+    done
+
+    if [ $download_success -eq 1 ]; then
+        {
+            if grep -q "^${START_TAG}" /etc/hosts && grep -q "^${END_TAG}" /etc/hosts; then
+                sed "/^${START_TAG}/,/^${END_TAG}/d" /etc/hosts
+            else
+                log "警告：标记不完整，将清除残留标记后追加新块"
+                sed -e "/^${START_TAG}/d" -e "/^${END_TAG}/d" /etc/hosts
+            fi
+            echo "$START_TAG"
+            sed 's/\r$//' "$TEMP_FILE"   # v6.18 去除 Windows 换行符（CRLF）
+            echo "$END_TAG"
+        } > "$HOSTS_TMP"
+        # v6.15 原子权限预置：先设权限再移动
+        chmod 644 "$HOSTS_TMP"
+        mv "$HOSTS_TMP" /etc/hosts
+        log "已应用新的 GitHub520 hosts"
+
+        flush_dns_cache
+
+        if network_ok; then
+            log "网络测试通过，更新成功！"
+            clean_old_backups
+            exit 0
+        else
+            log "警告：网络测试失败！正在回滚..."
+            rollback "$BACKUP_FILE"
+            if [ $? -eq 0 ]; then
+                BACKUP_FILE=""
+            else
+                log "严重错误：回滚失败，停止重试。"
+                exit 1
+            fi
+        fi
+    else
+        log "本轮所有下载源均失败"
+    fi
+
+    if [ $attempt -lt $MAX_RETRIES ]; then
+        log "等待 5 秒后开始下一轮重试..."
+        sleep 5
+    fi
+done
+
+log "错误：经过 $MAX_RETRIES 轮尝试后仍无法成功更新。已保留上一个可用的 hosts 配置。"
+exit 1
